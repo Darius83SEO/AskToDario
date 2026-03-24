@@ -18,7 +18,8 @@ import torch
 
 from scraper import (
     get_paa_cached, extract_paa_tree,
-    LANGUAGES, COUNTRIES, BRANCH_COLORS
+    LANGUAGES, COUNTRIES, BRANCH_COLORS,
+    _fetch_google
 )
 
 # === PAGE CONFIG ===
@@ -280,6 +281,25 @@ with tab_search:
 
         if not paa_only:
             st.warning("Nessun PAA trovato per questa query. Prova con un'altra keyword o controlla lingua/paese.")
+            # Debug: mostra cosa Google restituisce
+            with st.expander("🔧 Debug: HTML ricevuto da Google"):
+                debug_html = _fetch_google(query, data.get('hl', 'it'),
+                                           data.get('gl', 'it'),
+                                           data.get('google_domain', 'google.it'))
+                if debug_html is None:
+                    st.error("Google non ha restituito nessuna pagina (blocco, timeout o consent page)")
+                else:
+                    st.write(f"Lunghezza HTML: {len(debug_html)} caratteri")
+                    st.write(f"Contiene 'sorry': {'sorry' in debug_html.lower()}")
+                    st.write(f"Contiene 'consent': {'consent' in debug_html.lower()}")
+                    st.write(f"Contiene 'aria-expanded': {'aria-expanded' in debug_html}")
+                    st.write(f"Contiene 'people also ask': {'people also ask' in debug_html.lower()}")
+                    st.write(f"Contiene 'le persone hanno chiesto': {'le persone hanno chiesto' in debug_html.lower()}")
+                    st.write(f"Contiene 'data-sgrd': {'data-sgrd' in debug_html}")
+                    st.write(f"Contiene 'Cpkphb': {'Cpkphb' in debug_html}")
+                    st.write(f"Contiene 'AF_initDataCallback': {'AF_initDataCallback' in debug_html}")
+                    # Mostra primi 3000 caratteri
+                    st.code(debug_html[:3000], language="html")
         else:
             # --- Stats ---
             st.markdown("### 📈 Risultati")

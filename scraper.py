@@ -1,12 +1,14 @@
 """
 PAA Scraper - curl_cffi based (no browser needed)
 Usa curl_cffi per impersonare Chrome a livello TLS.
-Molto piu' veloce e leggero di Playwright, funziona su Streamlit Cloud.
+Cookie SOCS per bypassare la pagina di consenso EU.
+Parsing avanzato dei dati JSON embedded di Google.
 """
 
 import time
 import random
 import re
+import urllib.parse
 import streamlit as st
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
@@ -55,11 +57,104 @@ PAA_HEADINGS = [
     'pessoas tambem perguntam',
 ]
 
+# Cookie per bypassare la pagina di consenso EU di Google
+CONSENT_COOKIES = {
+    'SOCS': 'CAISHAgBEhJnd3NfMjAyNDA4MTUtMF9SQzIaAmVuIAEaBgiA_LyaBg',
+    'CONSENT': 'PENDING+987',
+}
+
+
+def _is_valid_paa(text):
+    """Verifica se un testo e' una domanda PAA valida."""
+    text = text.strip()
+    if not text or len(text) < 15 or len(text) > 250:
+        return False
+    lower = text.lower()
+    noise = ['cookie', 'privacy', 'feedback', 'impostazioni', 'accedi',
+             'cerca con google', 'segnala', 'classifica',
+             'top 10', 'ingredienti', 'procedimento', 'consigli per',
+             'sign in', 'settings', 'report', 'javascript']
+    if any(n in lower for n in noise):
+        return False
+    if len(text.split()) < 3:
+        return False
+    return True
+
+
+def _extract_from_af_callbacks(html_text):
+    """
+    Estrae PAA dai blob AF_initDataCallback di Google.
+    Google serializza i dati PAA in queste callback JS.
+    """
+    questions = []
+    seen = set()
+
+    # Trova tutti i AF_initDataCallback
+    pattern = r'AF_initDataCallback\(\s*\{[^}]*data:\s*(\[[\s\S]*?\])\s*\}\s*\)'
+    # Approccio alternativo: cerca i dati tra AF_initDataCallback e la chiusura
+    raw_blocks = re.findall(
+        r'AF_initDataCallback\(\s*(\{[\s\S]*?\})\s*\)\s*;',
+        html_text
+    )
+
+    for block in raw_blocks:
+        # Cerca stringhe che sembrano domande dentro i blocchi dati
+        # Pattern: stringhe tra virgolette che finiscono con ? o sono abbastanza lunghe
+        matches = re.findall(r'"([^"]{15,200})"', block)
+        for m in matches:
+            # Filtra: deve contenere spazi (essere una frase) e non essere un URL/codice
+            if ('/' in m and '.' in m) or m.startswith('http'):
+                continue
+            if '\\' in m and not m.endswith('?'):
+                continue
+            if m.endswith('?') and _is_valid_paa(m) and m not in seen:
+                seen.add(m)
+                questions.append(m)
+
+    return questions
+
+
+def _extract_from_json_scripts(html_text):
+    """
+    Cerca dati PAA nei tag <script> come array JSON.
+    Google spesso include dati strutturati nel JS della pagina.
+    """
+    questions = []
+    seen = set()
+
+    # Pattern 1: domande con punto interrogativo in JSON
+    matches = re.findall(r'"([^"]{15,200}\?)"', html_text)
+    for m in matches:
+        if any(h in m.lower() for h in PAA_HEADINGS):
+            continue
+        if ('/' in m and '.' in m) or m.startswith('http'):
+            continue
+        if _is_valid_paa(m) and m not in seen:
+            seen.add(m)
+            questions.append(m)
+
+    # Pattern 2: array con null e stringhe (formato protobuf-like di Google)
+    # Es: [null,null,"Qual è la pizza più buona?",null,...]
+    matches2 = re.findall(r'\[(?:null,)*"([^"]{15,200}\?)"', html_text)
+    for m in matches2:
+        if _is_valid_paa(m) and m not in seen:
+            seen.add(m)
+            questions.append(m)
+
+    # Pattern 3: data-initq attribute
+    matches3 = re.findall(r'data-initq="([^"]+)"', html_text)
+    for m in matches3:
+        if _is_valid_paa(m) and m not in seen:
+            seen.add(m)
+            questions.append(m)
+
+    return questions
+
 
 def extract_paa_from_html(html_text):
     """
     Estrae PAA dal codice HTML grezzo di Google.
-    Usa strategie multiple perche' Google cambia spesso la struttura.
+    Combina parsing DOM + parsing JSON/script per massima copertura.
     """
     soup = BeautifulSoup(html_text, 'html.parser')
     questions = []
@@ -67,27 +162,21 @@ def extract_paa_from_html(html_text):
 
     def add_q(text):
         text = text.strip()
-        if not text or len(text) < 15 or len(text) > 250 or text in seen:
+        if text in seen or not _is_valid_paa(text):
             return
+        # Rimuovi "google" dal noise check specifico per il contesto HTML
         lower = text.lower()
-        noise = ['cookie', 'privacy', 'feedback', 'impostazioni', 'accedi',
-                 'cerca con google', 'segnala', 'google', 'classifica',
-                 'top 10', 'ingredienti', 'procedimento', 'consigli per']
-        if any(n in lower for n in noise):
-            return
-        if text.split(' ').__len__() < 3:
+        if 'google' in lower:
             return
         seen.add(text)
         questions.append(text)
 
-    # --- Strategia 1: Trova sezione PAA tramite heading e prendi i div fratelli ---
+    # --- Strategia 1: Trova sezione PAA tramite heading ---
     for heading_text in PAA_HEADINGS:
-        # Cerca in span, div, h2, h3
         for tag in soup.find_all(string=re.compile(re.escape(heading_text), re.I)):
             container = tag.find_parent('div')
             if not container:
                 continue
-            # Risali fino a trovare il contenitore con piu' elementi
             for _ in range(8):
                 parent = container.find_parent('div')
                 if not parent:
@@ -98,12 +187,10 @@ def extract_paa_from_html(html_text):
                     break
                 container = parent
 
-            # Estrai domande dagli elementi espandibili
             for el in container.find_all(attrs={'aria-expanded': True}):
                 text = el.get_text(separator='\n').strip().split('\n')[0].strip()
                 add_q(text)
 
-            # Prova anche data-sgrd
             for el in container.find_all(attrs={'data-sgrd': 'true'}):
                 text = el.get_text(separator='\n').strip().split('\n')[0].strip()
                 add_q(text)
@@ -128,32 +215,22 @@ def extract_paa_from_html(html_text):
     if questions:
         return questions[:4]
 
-    # --- Strategia 4: related-question-pair legacy ---
+    # --- Strategia 4: related-question-pair ---
     for el in soup.select('.related-question-pair'):
         text = el.get_text(separator='\n').strip().split('\n')[0].strip()
         add_q(text)
     if questions:
         return questions[:4]
 
-    # --- Strategia 5: data-q attributo ---
+    # --- Strategia 5: data-q / data-initq ---
     for el in soup.select('[data-q]'):
         add_q(el.get('data-q', ''))
+    for el in soup.select('[data-initq]'):
+        add_q(el.get('data-initq', ''))
     if questions:
         return questions[:4]
 
-    # --- Strategia 6: Cerca nei tag <script> per dati JSON embedded ---
-    for script in soup.find_all('script'):
-        script_text = script.string or ''
-        # Cerca pattern tipo ["domanda?", ...] nel JS
-        matches = re.findall(r'"([^"]{20,150}\?)"', script_text)
-        for m in matches:
-            if any(h in m.lower() for h in PAA_HEADINGS):
-                continue
-            add_q(m)
-        if len(questions) >= 4:
-            return questions[:4]
-
-    # --- Strategia 7: Cerca aria-expanded elements globali ---
+    # --- Strategia 6: aria-expanded globale ---
     for el in soup.find_all(attrs={'aria-expanded': 'false'}):
         text = el.get_text(separator='\n').strip().split('\n')[0].strip()
         if len(text) > 15 and text.count(' ') >= 3:
@@ -161,15 +238,34 @@ def extract_paa_from_html(html_text):
     if questions:
         return questions[:4]
 
+    # --- Strategia 7: AF_initDataCallback (dati serializzati Google) ---
+    af_questions = _extract_from_af_callbacks(html_text)
+    for q in af_questions:
+        add_q(q)
+    if questions:
+        return questions[:4]
+
+    # --- Strategia 8: JSON/script generico ---
+    json_questions = _extract_from_json_scripts(html_text)
+    for q in json_questions:
+        add_q(q)
+    if questions:
+        return questions[:4]
+
     return questions[:4]
 
 
-def scrape_paa_single(query, hl='it', gl='it', google_domain='google.it'):
+def _fetch_google(query, hl, gl, google_domain):
     """
-    Scrapa i 4 PAA per una singola query usando curl_cffi.
-    Impersona Chrome a livello TLS per non farsi bloccare.
+    Fetch della pagina Google con gestione consent cookie e retry.
+    Prova prima la versione normale, poi gbv=1 (basic HTML).
     """
-    url = f"https://www.{google_domain}/search?q={query}&hl={hl}&gl={gl}&num=10"
+    encoded_q = urllib.parse.quote_plus(query)
+
+    urls = [
+        f"https://www.{google_domain}/search?q={encoded_q}&hl={hl}&gl={gl}&num=10&pws=0",
+        f"https://www.{google_domain}/search?q={encoded_q}&hl={hl}&gl={gl}&num=10&gbv=1",
+    ]
 
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -186,25 +282,52 @@ def scrape_paa_single(query, hl='it', gl='it', google_domain='google.it'):
         'Cache-Control': 'max-age=0',
     }
 
-    try:
-        response = curl_requests.get(
-            url,
-            headers=headers,
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
-        )
+    for url in urls:
+        try:
+            response = curl_requests.get(
+                url,
+                headers=headers,
+                cookies=CONSENT_COOKIES,
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            )
 
-        if response.status_code != 200:
-            return []
+            if response.status_code != 200:
+                continue
 
-        if 'sorry' in response.url.lower() or '/sorry/' in response.text[:500].lower():
-            return []
+            body = response.text
+            url_lower = response.url.lower()
 
-        return extract_paa_from_html(response.text)
+            # Pagina di blocco Google
+            if '/sorry/' in url_lower or 'sorry' in url_lower:
+                continue
 
-    except Exception as e:
+            # Pagina di consenso (non dovrebbe succedere con i cookie)
+            if 'consent.google' in url_lower:
+                continue
+
+            # Verifica che sia una pagina di risultati
+            if len(body) < 5000:
+                continue
+
+            return body
+
+        except Exception:
+            continue
+
+    return None
+
+
+def scrape_paa_single(query, hl='it', gl='it', google_domain='google.it'):
+    """
+    Scrapa i 4 PAA per una singola query usando curl_cffi.
+    """
+    html = _fetch_google(query, hl, gl, google_domain)
+    if not html:
         return []
+
+    return extract_paa_from_html(html)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -231,9 +354,8 @@ def extract_paa_tree(root_query, hl='it', gl='it', google_domain='google.it',
         if current_depth >= depth:
             return
 
-        # Delay tra richieste
         if request_count > 0:
-            time.sleep(random.uniform(0.8, 1.5))
+            time.sleep(random.uniform(1.0, 2.0))
 
         request_count += 1
         if progress_callback:
