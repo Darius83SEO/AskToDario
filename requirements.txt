@@ -1,0 +1,10 @@
+streamlit>=1.30.0
+playwright==1.49.1
+playwright-stealth==1.0.6
+beautifulsoup4>=4.12.0
+sentence-transformers>=2.2.0
+openpyxl>=3.1.0
+graphviz>=0.20.0
+pandas>=2.0.0
+numpy>=1.24.0
+torch>=2.0.0
