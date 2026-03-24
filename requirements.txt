@@ -1,5 +1,5 @@
 streamlit>=1.30.0
-playwright
+curl_cffi
 beautifulsoup4
 sentence-transformers
 openpyxl

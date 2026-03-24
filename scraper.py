@@ -1,26 +1,16 @@
 """
-PAA Scraper - Playwright-based Google PAA extraction
-Usa Playwright con stealth per evitare blocchi Google.
-Ogni richiesta apre un browser, scrapa e chiude (leggero per multi-utente).
+PAA Scraper - curl_cffi based (no browser needed)
+Usa curl_cffi per impersonare Chrome a livello TLS.
+Molto piu' veloce e leggero di Playwright, funziona su Streamlit Cloud.
 """
 
-import os
 import time
 import random
 import re
-import subprocess
 import streamlit as st
-from playwright.sync_api import sync_playwright
-
-# === Installazione browser Chromium (una volta sola) ===
-@st.cache_resource
-def install_browser():
-    """Installa Chromium per Playwright (eseguito una sola volta)"""
-    subprocess.run(
-        ["playwright", "install", "chromium"],
-        check=True, capture_output=True
-    )
-    return True
+from curl_cffi import requests as curl_requests
+from bs4 import BeautifulSoup
+import json
 
 # === Configurazione lingue e paesi ===
 LANGUAGES = {
@@ -45,209 +35,189 @@ COUNTRIES = {
     'Canada': ('ca', 'google.ca'), 'Mexico': ('mx', 'google.com.mx'),
 }
 
-# Colori per i rami
 BRANCH_COLORS = [
     '#4285F4', '#EA4335', '#FBBC05', '#34A853',
     '#FF6D01', '#46BDC6', '#9334E6', '#E91E63',
 ]
 
-# JS per estrarre i 4 PAA iniziali
-EXTRACT_PAA_JS = """
-() => {
-    var questions = [];
-    var seen = new Set();
-    function isNoise(text) {
-        var lower = text.toLowerCase();
-        var noise = ['cookie','privacy','feedback','impostazioni','accedi',
-            'cerca con google','segnala','le persone hanno chiesto anche',
-            'people also ask','altre domande','nutzer fragen auch',
-            'autres questions posees','la gente tambien pregunta',
-            'ingredienti','procedimento','classifica','top 10',
-            'consigli per','in breve','gusti di pizza'];
-        for (var i = 0; i < noise.length; i++) { if (lower.includes(noise[i])) return true; }
-        if (text.length < 15 || text.split(' ').length < 3) return true;
-        return false;
-    }
-    function addQ(text) {
-        text = text.trim();
-        if (text && !seen.has(text) && !isNoise(text) && text.length < 200) {
-            seen.add(text); questions.push(text);
-        }
-    }
-    var paaContainer = null;
-    var allEls = document.querySelectorAll('div, span, h2, h3');
-    for (var i = 0; i < allEls.length; i++) {
-        var txt = allEls[i].textContent.trim();
-        if (txt === 'Le persone hanno chiesto anche' || txt === 'People also ask' ||
-            txt === 'Nutzer fragen auch' || txt === 'Autres questions posees' ||
-            txt === 'La gente tambien pregunta' || txt === 'Altre domande' ||
-            txt === 'Andre sporger ogsa' || txt === 'Folk fragar ocksa') {
-            paaContainer = allEls[i];
-            for (var j = 0; j < 10; j++) {
-                if (!paaContainer.parentElement) break;
-                paaContainer = paaContainer.parentElement;
-                var items = paaContainer.querySelectorAll('[aria-expanded]');
-                if (items.length >= 4) break;
-            }
-            break;
-        }
-    }
-    if (paaContainer) {
-        var allItems = paaContainer.querySelectorAll('[aria-expanded]');
-        for (var k = 0; k < allItems.length && questions.length < 4; k++) {
-            addQ(allItems[k].textContent.trim().split('\\n')[0].trim());
-        }
-    }
-    if (questions.length === 0) {
-        document.querySelectorAll('[data-sgrd="true"]').forEach(function(el) {
-            if (questions.length < 4) addQ(el.textContent.trim().split('\\n')[0].trim());
-        });
-    }
-    if (questions.length === 0) {
-        document.querySelectorAll('div[jsname="Cpkphb"]').forEach(function(el) {
-            if (questions.length >= 4) return;
-            var spans = el.querySelectorAll('span');
-            for (var s = 0; s < spans.length; s++) {
-                if (spans[s].textContent.trim().length > 15) { addQ(spans[s].textContent.trim()); break; }
-            }
-        });
-    }
-    if (questions.length === 0) {
-        document.querySelectorAll('.related-question-pair').forEach(function(el) {
-            if (questions.length < 4) addQ(el.textContent.trim().split('\\n')[0].trim());
-        });
-    }
-    if (questions.length === 0) {
-        document.querySelectorAll('[data-q]').forEach(function(el) {
-            if (questions.length < 4) addQ(el.getAttribute('data-q'));
-        });
-    }
-    return questions;
-}
-"""
+# PAA heading texts per lingua
+PAA_HEADINGS = [
+    'le persone hanno chiesto anche',
+    'people also ask',
+    'nutzer fragen auch',
+    'autres questions posees',
+    'otras preguntas de los usuarios',
+    'la gente tambien pregunta',
+    'altre domande',
+    'andre sporger ogsa',
+    'folk fragar ocksa',
+    'os utilizadores tambem perguntam',
+    'pessoas tambem perguntam',
+]
 
 
-def _handle_consent(page):
-    """Gestisce cookie consent di Google"""
-    try:
-        # Prova bottoni diretti
-        for sel in ['button#L2AGLb', 'button#W0wltc', 'button[jsname="higCR"]',
-                     'button[jsname="b3VHJd"]']:
-            btn = page.query_selector(sel)
-            if btn and btn.is_visible():
-                btn.click()
-                page.wait_for_timeout(1500)
-                return
-        # Prova in iframe
-        for frame in page.frames:
-            for sel in ['button#L2AGLb', 'button#W0wltc', 'button[jsname="higCR"]']:
-                try:
-                    btn = frame.query_selector(sel)
-                    if btn and btn.is_visible():
-                        btn.click()
-                        page.wait_for_timeout(1500)
-                        return
-                except:
-                    continue
-        # Prova per testo
-        for btn in page.query_selector_all('button'):
-            try:
-                txt = btn.inner_text().strip().lower()
-                if any(kw in txt for kw in ['accetta', 'accept', 'agree']):
-                    btn.click()
-                    page.wait_for_timeout(1500)
-                    return
-            except:
+def extract_paa_from_html(html_text):
+    """
+    Estrae PAA dal codice HTML grezzo di Google.
+    Usa strategie multiple perche' Google cambia spesso la struttura.
+    """
+    soup = BeautifulSoup(html_text, 'html.parser')
+    questions = []
+    seen = set()
+
+    def add_q(text):
+        text = text.strip()
+        if not text or len(text) < 15 or len(text) > 250 or text in seen:
+            return
+        lower = text.lower()
+        noise = ['cookie', 'privacy', 'feedback', 'impostazioni', 'accedi',
+                 'cerca con google', 'segnala', 'google', 'classifica',
+                 'top 10', 'ingredienti', 'procedimento', 'consigli per']
+        if any(n in lower for n in noise):
+            return
+        if text.split(' ').__len__() < 3:
+            return
+        seen.add(text)
+        questions.append(text)
+
+    # --- Strategia 1: Trova sezione PAA tramite heading e prendi i div fratelli ---
+    for heading_text in PAA_HEADINGS:
+        # Cerca in span, div, h2, h3
+        for tag in soup.find_all(string=re.compile(re.escape(heading_text), re.I)):
+            container = tag.find_parent('div')
+            if not container:
                 continue
-    except:
-        pass
+            # Risali fino a trovare il contenitore con piu' elementi
+            for _ in range(8):
+                parent = container.find_parent('div')
+                if not parent:
+                    break
+                expandables = parent.find_all(attrs={'aria-expanded': True})
+                if len(expandables) >= 3:
+                    container = parent
+                    break
+                container = parent
+
+            # Estrai domande dagli elementi espandibili
+            for el in container.find_all(attrs={'aria-expanded': True}):
+                text = el.get_text(separator='\n').strip().split('\n')[0].strip()
+                add_q(text)
+
+            # Prova anche data-sgrd
+            for el in container.find_all(attrs={'data-sgrd': 'true'}):
+                text = el.get_text(separator='\n').strip().split('\n')[0].strip()
+                add_q(text)
+
+            if questions:
+                return questions[:4]
+
+    # --- Strategia 2: data-sgrd globale ---
+    for el in soup.select('[data-sgrd="true"]'):
+        text = el.get_text(separator='\n').strip().split('\n')[0].strip()
+        add_q(text)
+    if questions:
+        return questions[:4]
+
+    # --- Strategia 3: jsname Cpkphb ---
+    for el in soup.select('div[jsname="Cpkphb"]'):
+        for span in el.find_all('span'):
+            text = span.get_text().strip()
+            if len(text) > 15:
+                add_q(text)
+                break
+    if questions:
+        return questions[:4]
+
+    # --- Strategia 4: related-question-pair legacy ---
+    for el in soup.select('.related-question-pair'):
+        text = el.get_text(separator='\n').strip().split('\n')[0].strip()
+        add_q(text)
+    if questions:
+        return questions[:4]
+
+    # --- Strategia 5: data-q attributo ---
+    for el in soup.select('[data-q]'):
+        add_q(el.get('data-q', ''))
+    if questions:
+        return questions[:4]
+
+    # --- Strategia 6: Cerca nei tag <script> per dati JSON embedded ---
+    for script in soup.find_all('script'):
+        script_text = script.string or ''
+        # Cerca pattern tipo ["domanda?", ...] nel JS
+        matches = re.findall(r'"([^"]{20,150}\?)"', script_text)
+        for m in matches:
+            if any(h in m.lower() for h in PAA_HEADINGS):
+                continue
+            add_q(m)
+        if len(questions) >= 4:
+            return questions[:4]
+
+    # --- Strategia 7: Cerca aria-expanded elements globali ---
+    for el in soup.find_all(attrs={'aria-expanded': 'false'}):
+        text = el.get_text(separator='\n').strip().split('\n')[0].strip()
+        if len(text) > 15 and text.count(' ') >= 3:
+            add_q(text)
+    if questions:
+        return questions[:4]
+
+    return questions[:4]
 
 
 def scrape_paa_single(query, hl='it', gl='it', google_domain='google.it'):
     """
-    Scrapa i 4 PAA per una singola query.
-    Apre browser -> scrapa -> chiude. Leggero per multi-utente.
+    Scrapa i 4 PAA per una singola query usando curl_cffi.
+    Impersona Chrome a livello TLS per non farsi bloccare.
     """
-    questions = []
-    url = f"https://www.{google_domain}/search?q={query}&hl={hl}&gl={gl}"
+    url = f"https://www.{google_domain}/search?q={query}&hl={hl}&gl={gl}&num=10"
+
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': f'{hl},{hl[:2]};q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': f'https://www.{google_domain}/',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+    }
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-blink-features=AutomationControlled',
-                ]
-            )
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                locale=hl,
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/131.0.0.0 Safari/537.36'
-                ),
-            )
-            page = context.new_page()
-            # Anti-detection: rimuovi flag webdriver
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['it-IT','it','en-US','en']});
-            """)
+        response = curl_requests.get(
+            url,
+            headers=headers,
+            impersonate="chrome",
+            timeout=15,
+            allow_redirects=True,
+        )
 
-            # Prima visita per consent
-            page.goto(f"https://www.{google_domain}/", wait_until='domcontentloaded', timeout=15000)
-            page.wait_for_timeout(2000)
-            _handle_consent(page)
+        if response.status_code != 200:
+            return []
 
-            # Ricerca vera
-            page.goto(url, wait_until='domcontentloaded', timeout=15000)
-            page.wait_for_timeout(random.randint(2000, 3500))
+        if 'sorry' in response.url.lower() or '/sorry/' in response.text[:500].lower():
+            return []
 
-            # Check blocco
-            if 'sorry' in page.url.lower():
-                browser.close()
-                return []
-
-            # Scrolla per caricare PAA
-            page.evaluate("window.scrollTo(0, 400)")
-            page.wait_for_timeout(1000)
-
-            # Estrai PAA
-            questions = page.evaluate(EXTRACT_PAA_JS)
-
-            if not questions:
-                page.evaluate("window.scrollTo(0, 800)")
-                page.wait_for_timeout(1500)
-                questions = page.evaluate(EXTRACT_PAA_JS)
-
-            browser.close()
+        return extract_paa_from_html(response.text)
 
     except Exception as e:
-        st.warning(f"Errore scraping: {str(e)[:100]}")
-
-    return questions or []
+        return []
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_paa_cached(query, hl, gl, google_domain):
-    """Versione cachata - stessa query non viene ri-scrapata per 1 ora"""
+    """Versione cachata — stessa query non viene ri-scrapata per 1 ora"""
     return scrape_paa_single(query, hl, gl, google_domain)
 
 
 def extract_paa_tree(root_query, hl='it', gl='it', google_domain='google.it',
                      depth=3, progress_callback=None):
     """
-    Estrazione ad albero completa: 4 PAA x livello, ricorsiva.
+    Estrazione ad albero: 4 PAA x livello, ricorsiva.
     Ritorna: (all_questions, edges, question_branches)
-    - all_questions: list of (text, level, parent, branch_idx)
-    - edges: list of (parent, child)
-    - question_branches: dict question -> branch_index
     """
     all_questions = [(root_query, 0, None, -1)]
     edges = []
@@ -263,7 +233,7 @@ def extract_paa_tree(root_query, hl='it', gl='it', google_domain='google.it',
 
         # Delay tra richieste
         if request_count > 0:
-            time.sleep(random.uniform(1.5, 2.5))
+            time.sleep(random.uniform(0.8, 1.5))
 
         request_count += 1
         if progress_callback:

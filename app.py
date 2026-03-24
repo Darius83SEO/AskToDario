@@ -17,7 +17,7 @@ from sentence_transformers import SentenceTransformer, util
 import torch
 
 from scraper import (
-    install_browser, get_paa_cached, extract_paa_tree,
+    get_paa_cached, extract_paa_tree,
     LANGUAGES, COUNTRIES, BRANCH_COLORS
 )
 
@@ -161,10 +161,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# === INSTALL BROWSER ===
-with st.spinner("Primo avvio: installazione browser..."):
-    install_browser()
-
 # === NLP MODEL ===
 @st.cache_resource
 def load_nlp_model():
@@ -211,7 +207,7 @@ with st.sidebar:
     gl, google_domain = COUNTRIES[country_name]
 
     est_requests = sum(4**i for i in range(1, depth + 1)) + 1
-    est_time = est_requests * 3
+    est_time = int(est_requests * 1.5)
     st.caption(f"Richieste stimate: ~{est_requests} | Tempo: ~{est_time//60}m {est_time%60}s")
 
     st.markdown("---")
