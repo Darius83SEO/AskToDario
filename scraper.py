@@ -11,7 +11,6 @@ import re
 import subprocess
 import streamlit as st
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 # === Installazione browser Chromium (una volta sola) ===
 @st.cache_resource
@@ -193,7 +192,13 @@ def scrape_paa_single(query, hl='it', gl='it', google_domain='google.it'):
                 ),
             )
             page = context.new_page()
-            stealth_sync(page)
+            # Anti-detection: rimuovi flag webdriver
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['it-IT','it','en-US','en']});
+            """)
 
             # Prima visita per consent
             page.goto(f"https://www.{google_domain}/", wait_until='domcontentloaded', timeout=15000)

@@ -1,6 +1,5 @@
 streamlit>=1.30.0
 playwright
-playwright-stealth
 beautifulsoup4
 sentence-transformers
 openpyxl
